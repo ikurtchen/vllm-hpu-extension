@@ -20,6 +20,9 @@ FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 if is_hpu_gaudi2:
     FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
 
+log_counter = 0
+max_log_count = -1
+
 import os
 
 def get_inc_quant_method(layer):
@@ -51,8 +54,12 @@ def group_sum(partial_sum, block_mapping):
     return sums
 
 def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, batch_size,
-                 matmul_av_op, batch2block_matmul_op, block2batch_matmul_op):
+                 matmul_av_op, batch2block_matmul_op, block2batch_matmul_op, layer_number=-1):
+    global log_counter
+    global max_log_count
     fused_block_softmax_adjustment_requirements = get_config().fused_block_softmax_adjustment and attn.dtype != torch.float16
+    if torch.distributed.get_rank() == 0 and layer_number == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        print(f"pipelined_pa({log_counter}): {attn.shape=}, {value.shape=}, {block_mapping.shape=}, block_bias: {block_bias.shape if block_bias is not None else None}, {block_groups.shape=}, {batch_size=}, {fused_block_softmax_adjustment_requirements=}")
     # When fp32_softmax is enabled attn is left in fp32 after Q@K
     # We can return to native dtype after we renormalize and calculate the adjustments
     if block_bias is not None and attn.dtype != block_bias.dtype:
@@ -72,6 +79,8 @@ def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, batch_siz
             attn = attn.to(value.dtype)
         block_sums = attn.sum(dim=-1, keepdim=True)
     attn = matmul_av_op(attn, value)
+    if torch.distributed.get_rank() == 0 and layer_number == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        print(f"pipelined_pa({log_counter}) after matmul_av_op: {attn.shape=}")
     if fused_block_softmax_adjustment_requirements:
         out_shape = list(attn.shape[:3]) + [1] * (attn.dim() - 3)
         rescale = torch.ops.hpu.block_softmax_adjustment(block_max,
@@ -79,6 +88,8 @@ def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, batch_siz
                                                          block_groups,
                                                          batch_size,
                                                          out_shape).to(attn.dtype)
+        if torch.distributed.get_rank() == 0 and layer_number == 0 and (max_log_count < 0 or log_counter < max_log_count):
+            print(f"pipelined_pa({log_counter}) block sftmax: {out_shape=}, {rescale.shape}")
     else:
         adjustment_target_shape = block_max.shape
         block_max = block_max.squeeze((-1, -2))
@@ -91,22 +102,32 @@ def pipelined_pa(attn, value, block_bias, block_groups, block_mapping, batch_siz
             block_adjustment = block_adjustment.to(value.dtype)
         sum_adjusted = block_sums.mul(block_adjustment)
 
+        if torch.distributed.get_rank() == 0 and layer_number == 0 and (max_log_count < 0 or log_counter < max_log_count):
+            print(f"pipelined_pa({log_counter}): {sum_adjusted.shape=}")
         # Sum block's sums that belongs to the same sequences
         group_sum_adjusted = block2batch(sum_adjusted, block_mapping, block2batch_matmul_op)
+        if torch.distributed.get_rank() == 0 and layer_number == 0 and (max_log_count < 0 or log_counter < max_log_count):
+            print(f"pipelined_pa({log_counter}) after block2batch: {group_sum_adjusted.shape=}")
         group_sum_adjusted = batch2block(group_sum_adjusted, block_mapping, batch2block_matmul_op)
+        if torch.distributed.get_rank() == 0 and layer_number == 0 and (max_log_count < 0 or log_counter < max_log_count):
+            print(f"pipelined_pa({log_counter}) after batch2block: {group_sum_adjusted.shape=}")
         sum_adjusted = sum_adjusted.view(*adjustment_target_shape)
         group_sum_adjusted = group_sum_adjusted.view(*adjustment_target_shape)
         block_adjustment = block_adjustment.view(*adjustment_target_shape)
+        if torch.distributed.get_rank() == 0 and layer_number == 0 and (max_log_count < 0 or log_counter < max_log_count):
+            print(f"pipelined_pa({log_counter}) after reshape: {sum_adjusted.shape=}, {group_sum_adjusted.shape=}, {block_adjustment.shape=}")
 
         # For stability in case some of the sums have been zeroed out during block aggretation
         group_sum_adjusted = torch.maximum(group_sum_adjusted, sum_adjusted)
         # Post processing for the attention scores
         rescale = block_adjustment.div(group_sum_adjusted)
+        if torch.distributed.get_rank() == 0 and layer_number == 0 and (max_log_count < 0 or log_counter < max_log_count):
+            print(f"pipelined_pa({log_counter}) rescale: {group_sum_adjusted.shape=}, {rescale.shape=}")
     attn = attn.mul(rescale)
     return attn
 
 def const_norm_pa(attn, value, block_bias, block_groups, block_mapping, batch_size,
-                 matmul_av_op, batch2block_matmul_op, block2batch_matmul_op):
+                 matmul_av_op, batch2block_matmul_op, block2batch_matmul_op, layer_number=-1):
     if block_bias is not None and attn.dtype != block_bias.dtype:
         block_bias = block_bias.to(dtype=attn.dtype)
     if block_bias is not None:
@@ -182,6 +203,11 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
             position_bias, matmul_av_op, batch2block_matmul_op,
             block2batch_matmul_op, keys_fetch_func, values_fetch_func,
             **ignored_args):
+
+    global log_counter
+    global max_log_count
+    if torch.distributed.get_rank() == 0 and ignored_args.get('layer_number', -1) == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        print(f"flat_pa({log_counter}): {query.shape=}, {key_cache.shape=}, {value_cache.shape=}, {block_list.shape=}, {block_mapping.shape=}, block_bias: {block_bias.shape if block_bias is not None else None}, {block_groups.shape=}, {block_size=}, {scale=}, position_bias: {position_bias.shape if position_bias is not None else None}")
     batch_size, _, hidden_size = query.shape
     _, kv_heads, head_size = key_cache.shape
     q_heads = hidden_size // head_size
@@ -191,6 +217,10 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
     key = keys_fetch_func(key_cache.unflatten(0, (-1, block_size)), block_list).transpose(1, 2)
     value = values_fetch_func(value_cache.unflatten(0, (-1, block_size)), block_list).transpose(1, 2)
     block_bias = block_bias.view(key.size(0), 1, 1, -1)
+
+    if torch.distributed.get_rank() == 0 and ignored_args.get('layer_number', -1) == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        print(f"flat_pa({log_counter}) after fetch: {query.shape=}, {key.shape=}, {value.shape=}, block_bias: {block_bias.shape if block_bias is not None else None}")
+
     if kv_heads != q_heads:
         query = query.unflatten(1, (kv_heads, -1))
         key = key.unflatten(1, (kv_heads, 1))
@@ -199,6 +229,8 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
             position_bias = position_bias.unflatten(1, (kv_heads, -1))
         if block_bias is not None:
             block_bias = block_bias.unsqueeze(2)
+    if torch.distributed.get_rank() == 0 and ignored_args.get('layer_number', -1) == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        print(f"flat_pa({log_counter}) after head adjust: {query.shape=}, {key.shape=}, {value.shape=}, {block_bias.shape if block_bias is not None else None}")
     key = key.transpose(-2, -1)
 
     attn = matmul_qk_op(query, key)
@@ -212,18 +244,30 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
             attn = attn.to(dtype=position_bias.dtype)
         attn.add_(position_bias.unsqueeze(-2))
 
+    if torch.distributed.get_rank() == 0 and ignored_args.get('layer_number', -1) == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        print(f"flat_pa({log_counter}) after QK: {attn.shape=}")
     if get_config().use_const_norm:
         pa_impl = const_norm_pa
     else:
         pa_impl = pipelined_pa
     attn = pa_impl(attn, value, block_bias, block_groups, block_mapping,
                         batch_size=batch_size, matmul_av_op=matmul_av_op,
-                        batch2block_matmul_op=batch2block_matmul_op, block2batch_matmul_op=block2batch_matmul_op)
+                        batch2block_matmul_op=batch2block_matmul_op, block2batch_matmul_op=block2batch_matmul_op, layer_number=ignored_args.get('layer_number', -1))
+    if torch.distributed.get_rank() == 0 and ignored_args.get('layer_number', -1) == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        print(f"flat_pa({log_counter}) after PA: {attn.shape=}")
     attn = block2batch(attn, block_mapping, block2batch_matmul_op)
     attn = attn.squeeze(-2)
 
+    if torch.distributed.get_rank() == 0 and ignored_args.get('layer_number', -1) == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        print(f"flat_pa({log_counter}) after block2batch: {attn.shape=}")
     if kv_heads != q_heads:
         attn = attn.flatten(1, 2)
+
+    if torch.distributed.get_rank() == 0 and ignored_args.get('layer_number', -1) == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        print(f"flat_pa({log_counter}) final output: {attn.shape=}")
+
+    if torch.distributed.get_rank() == 0 and ignored_args.get('layer_number', -1) == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        log_counter += 1
     return attn
 
 
@@ -357,6 +401,10 @@ def _fsdpa_prompt_attention(
                                 valid_seq_lengths, padding_side]
     args += [window_size] if window_size else []
 
+    global log_counter
+    global max_log_count
+    if torch.distributed.get_rank() == 0 and ignored_args.get('layer_number', -1) == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        print(f"fsdpa_op args: {[arg.shape if arg is not None and isinstance(arg, torch.Tensor) else arg for arg in args]}")
 
     attn_weights = fsdpa_op(*args)
 
@@ -368,7 +416,14 @@ def prompt_attention(
         impl: str,
         **args,
 ) -> torch.Tensor:
-    _get_context(args)
+    global log_counter
+    global max_log_count
+    if args['is_causal']:
+        if torch.distributed.get_rank() == 0 and args.get('layer_number', -1) == 0 and (max_log_count < 0 or log_counter < max_log_count):
+            print(f"Using causal attention: {args['query'].shape=}, {args['key'].shape=}, {args['value'].shape=}, key_cache: {args['key_cache'].shape if args['key_cache'] is not None else None}, value_cache: {args['value_cache'].shape if args['value_cache'] is not None else None}")
+        _get_context(args)
+    if torch.distributed.get_rank() == 0 and args.get('layer_number', -1) == 0 and (max_log_count < 0 or log_counter < max_log_count):
+        print(f"after get context: {args['query'].shape=}, {args['key'].shape=}, {args['value'].shape=}, key_cache: {args['key_cache'].shape if args['key_cache'] is not None else None}, value_cache: {args['value_cache'].shape if args['value_cache'] is not None else None}")
     impl_mapping = {
         'naive_impl': _naive_prompt_attention,
         'fsdpa_impl': _fsdpa_prompt_attention,
