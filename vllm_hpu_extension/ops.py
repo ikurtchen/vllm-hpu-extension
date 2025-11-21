@@ -22,6 +22,8 @@ if is_hpu_gaudi2:
 
 import os
 
+HAS_INC_QUANT_CONFIG = os.getenv("QUANT_CONFIG", None) is not None
+
 def get_inc_quant_method(layer):
     return layer
 
@@ -416,10 +418,10 @@ def _include_past(tensor_str, fn_str, cache_str, args):
         past = fn(cache.unflatten(0, (-1, block_size)), block_list)
         past = past.reshape(current.size(0), -1, past.shape[2], past.shape[3])
 
-        # TODO cache the settings
         qkv_slice_thld = get_config().VLLM_FUSEDSDPA_QKV_SLICE_SEQ_LEN_THLD
         qkv_slice_thld = qkv_slice_thld if qkv_slice_thld is not None else 8192
-        if qkv_slice_thld > 0 and (past.size(1) >= qkv_slice_thld
+        # INC should have its own QKV slicing for FP8
+        if not HAS_INC_QUANT_CONFIG and qkv_slice_thld > 0 and (past.size(1) >= qkv_slice_thld
                                    or current.size(1) >= qkv_slice_thld):
             args[tensor_str] = current
             args[tensor_str + '_prefix'] = past
@@ -1550,7 +1552,8 @@ class QKVSliceCausalSDPA(torch.autograd.Function):
             key_slice = key[..., query_start:query_end, :]
             value_slice = value[..., query_start:query_end, :]
 
-            bs, _, _, q_len, _ = query_slice.shape
+            bs = query_slice.size(0)
+            q_len = query_slice.size(-2)
 
             # Kernel limitation, need to use not causal and pass mask to get correct m and linv
             if query_slice.size(2) < chunk_size:
@@ -1601,7 +1604,7 @@ class QKVSliceCausalSDPA(torch.autograd.Function):
                     ori_shape[:-1]), linv.reshape(ori_shape[:-1])
 
             if softmax_mode == "fast":
-                linv = linv * 128
+                linv = linv.to(torch.float32) * 128
             else:
                 linv = linv.to(torch.float32)
             m = m.to(torch.float32)
